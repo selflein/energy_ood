@@ -10,6 +10,7 @@ import torchvision.transforms as trn
 import torchvision.datasets as dset
 import torch.nn.functional as F
 from models.wrn import WideResNet
+from pathlib import Path
 from skimage.filters import gaussian as gblur
 from PIL import Image as PILImage
 
@@ -23,6 +24,7 @@ if __package__ is None:
     import utils.svhn_loader as svhn
     import utils.lsun_loader as lsun_loader
     import utils.score_calculation as lib
+    from utils.calibration import classification_calibration
 
 parser = argparse.ArgumentParser(description='Evaluates a CIFAR OOD Detector',
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -44,11 +46,14 @@ parser.add_argument('--out_as_pos', action='store_true', help='OE define OOD dat
 parser.add_argument('--score', default='MSP', type=str, help='score options: MSP|energy')
 parser.add_argument('--T', default=1., type=float, help='temperature: energy|Odin')
 parser.add_argument('--noise', type=float, default=0, help='noise for Odin')
+parser.add_argument("--data_root", type=str)
+parser.add_argument("--ood_dataset", type=str, action="append")
 args = parser.parse_args()
 print(args)
 # torch.manual_seed(1)
 # np.random.seed(1)
 
+data_root = Path(args.data_root)
 # mean and standard deviation of channels of CIFAR-10 images
 mean = [x / 255 for x in [125.3, 123.0, 113.9]]
 std = [x / 255 for x in [63.0, 62.1, 66.7]]
@@ -56,10 +61,10 @@ std = [x / 255 for x in [63.0, 62.1, 66.7]]
 test_transform = trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)])
 
 if 'cifar10_' in args.method_name:
-    test_data = dset.CIFAR10('../data/cifarpy', train=False, transform=test_transform)
+    test_data = dset.CIFAR10(data_root, train=False, transform=test_transform)
     num_classes = 10
 else:
-    test_data = dset.CIFAR100('../data/cifarpy', train=False, transform=test_transform)
+    test_data = dset.CIFAR100(data_root, train=False, transform=test_transform)
     num_classes = 100
 
 
@@ -116,6 +121,8 @@ def get_ood_scores(loader, in_dist=False):
     _score = []
     _right_score = []
     _wrong_score = []
+    _probs = []
+    _targets = []
 
     with torch.no_grad():
         for batch_idx, (data, target) in enumerate(loader):
@@ -126,6 +133,8 @@ def get_ood_scores(loader, in_dist=False):
 
             output = net(data)
             smax = to_np(F.softmax(output, dim=1))
+            _probs.append(to_np(smax))
+            _targets.append(to_np(target))
 
             if args.use_xent:
                 _score.append(to_np((output.mean(1) - torch.logsumexp(output, dim=1))))
@@ -149,26 +158,25 @@ def get_ood_scores(loader, in_dist=False):
                     _wrong_score.append(-np.max(smax[wrong_indices], axis=1))
 
     if in_dist:
-        return concat(_score).copy(), concat(_right_score).copy(), concat(_wrong_score).copy()
+        return concat(_score).copy(), concat(_right_score).copy(), concat(_wrong_score).copy(), concat(_probs).copy(), concat(_targets).copy()
     else:
-        return concat(_score)[:ood_num_examples].copy()
+        return concat(_score)[:ood_num_examples].copy(), concat(_probs).copy(), concat(_targets).copy()
+    
 if args.score == 'Odin':
     # separated because no grad is not applied
     in_score, right_score, wrong_score = lib.get_ood_scores_odin(test_loader, net, args.test_bs, ood_num_examples, args.T, args.noise, in_dist=True)
 elif args.score == 'M':
     from torch.autograd import Variable
-    _, right_score, wrong_score = get_ood_scores(test_loader, in_dist=True)
-
+    _, right_score, wrong_score, probs, targets = get_ood_scores(test_loader, in_dist=True)
 
     if 'cifar10_' in args.method_name:
-        train_data = dset.CIFAR10('../data/cifarpy', train=True, transform=test_transform)
+        train_data = dset.CIFAR10(data_root, train=True, transform=test_transform)
     else:
-        train_data = dset.CIFAR100('../data/cifarpy', train=True, transform=test_transform)
+        train_data = dset.CIFAR100(data_root, train=True, transform=test_transform)
 
     train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.test_bs, shuffle=False, 
                                           num_workers=args.prefetch, pin_memory=True)
     num_batches = ood_num_examples // args.test_bs
-
     temp_x = torch.rand(2,3,32,32)
     temp_x = Variable(temp_x)
     temp_x = temp_x.cuda()
@@ -185,7 +193,10 @@ elif args.score == 'M':
     in_score = lib.get_Mahalanobis_score(net, test_loader, num_classes, sample_mean, precision, count-1, args.noise, num_batches, in_dist=True)
     print(in_score[-3:], in_score[-103:-100])
 else:
-    in_score, right_score, wrong_score = get_ood_scores(test_loader, in_dist=True)
+    in_score, right_score, wrong_score, probs, targets = get_ood_scores(test_loader, in_dist=True)
+
+    # ID Calibration
+    classification_calibration(np.squeeze(targets), probs, tag="ID")
 
 num_right = len(right_score)
 num_wrong = len(wrong_score)
@@ -214,7 +225,11 @@ def get_and_print_results(ood_loader, num_to_avg=args.num_to_avg):
         elif args.score == 'M':
             out_score = lib.get_Mahalanobis_score(net, ood_loader, num_classes, sample_mean, precision, count-1, args.noise, num_batches)
         else:
-            out_score = get_ood_scores(ood_loader)
+            out_score, _probs, targets = get_ood_scores(ood_loader)
+
+            # ID Calibration
+            classification_calibration(np.squeeze(targets), probs, tag="OOD")
+
         if args.out_as_pos: # OE's defines out samples as positive
             measures = get_measures(out_score, in_score)
         else:
@@ -223,64 +238,71 @@ def get_and_print_results(ood_loader, num_to_avg=args.num_to_avg):
     print(in_score[:3], out_score[:3])
     auroc = np.mean(aurocs); aupr = np.mean(auprs); fpr = np.mean(fprs)
     auroc_list.append(auroc); aupr_list.append(aupr); fpr_list.append(fpr)
-
+    
     if num_to_avg >= 5:
         print_measures_with_std(aurocs, auprs, fprs, args.method_name)
     else:
         print_measures(auroc, aupr, fpr, args.method_name)
 
 
-# /////////////// Textures ///////////////
-ood_data = dset.ImageFolder(root="../data/dtd/images",
-                            transform=trn.Compose([trn.Resize(32), trn.CenterCrop(32),
-                                                   trn.ToTensor(), trn.Normalize(mean, std)]))
-ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
-                                         num_workers=4, pin_memory=True)
-print('\n\nTexture Detection')
-get_and_print_results(ood_loader)
+if "textures" in args.ood_datasets:
+    # /////////////// Textures ///////////////
+    ood_data = dset.ImageFolder(root=data_root / "dtd" / "images",
+                                transform=trn.Compose([trn.Resize(32), trn.CenterCrop(32),
+                                                       trn.ToTensor(), trn.Normalize(mean, std)]))
+    ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
+                                             num_workers=4, pin_memory=True)
+    print('\n\nTexture Detection')
+    get_and_print_results(ood_loader)
 
-# /////////////// SVHN /////////////// # cropped and no sampling of the test set
-ood_data = svhn.SVHN(root='../data/svhn/', split="test",
-                     transform=trn.Compose(
-                         [#trn.Resize(32), 
-                         trn.ToTensor(), trn.Normalize(mean, std)]), download=False)
-ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
-                                         num_workers=2, pin_memory=True)
-print('\n\nSVHN Detection')
-get_and_print_results(ood_loader)
+if "svhn" in args.ood_datasets:
+    # /////////////// SVHN /////////////// # cropped and no sampling of the test set
+    ood_data = svhn.SVHN(root=data_root, split="test",
+                         transform=trn.Compose(
+                             [#trn.Resize(32), 
+                             trn.ToTensor(), trn.Normalize(mean, std)]), download=True)
+    ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
+                                             num_workers=2, pin_memory=True)
+    print('\n\nSVHN Detection')
+    get_and_print_results(ood_loader)
 
-# /////////////// Places365 ///////////////
-ood_data = dset.ImageFolder(root="../data/places365/",
-                            transform=trn.Compose([trn.Resize(32), trn.CenterCrop(32),
-                                                   trn.ToTensor(), trn.Normalize(mean, std)]))
-ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
-                                         num_workers=2, pin_memory=True)
-print('\n\nPlaces365 Detection')
-get_and_print_results(ood_loader)
+if "places365" in args.ood_datasets:
+    # /////////////// Places365 ///////////////
+    ood_data = dset.ImageFolder(root= data_root / "places365",
+                                transform=trn.Compose([trn.Resize(32), trn.CenterCrop(32),
+                                                       trn.ToTensor(), trn.Normalize(mean, std)]))
+    ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
+                                             num_workers=2, pin_memory=True)
+    print('\n\nPlaces365 Detection')
+    get_and_print_results(ood_loader)
 
-# /////////////// LSUN-C ///////////////
-ood_data = dset.ImageFolder(root="../data/LSUN_C",
-                            transform=trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)]))
-ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
-                                         num_workers=1, pin_memory=True)
-print('\n\nLSUN_C Detection')
-get_and_print_results(ood_loader)
+if "lsun-c" in args.ood_datasets:
+    # /////////////// LSUN-C ///////////////
+    ood_data = dset.LSUN(root=data_root,
+                                transform=trn.Compose([trn.CenterCrop(32), trn.ToTensor(), trn.Normalize(mean, std)]))
+    ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
+                                             num_workers=1, pin_memory=True)
+    print('\n\nLSUN_C Detection')
+    get_and_print_results(ood_loader)
 
-# /////////////// LSUN-R ///////////////
-ood_data = dset.ImageFolder(root="../data/LSUN_resize",
-                            transform=trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)]))
-ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
-                                         num_workers=1, pin_memory=True)
-print('\n\nLSUN_Resize Detection')
-get_and_print_results(ood_loader)
 
-# /////////////// iSUN ///////////////
-ood_data = dset.ImageFolder(root="../data/iSUN",
-                            transform=trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)]))
-ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
-                                         num_workers=1, pin_memory=True)
-print('\n\niSUN Detection')
-get_and_print_results(ood_loader)
+if "lsun" in args.ood_datasets:
+    # /////////////// LSUN-R ///////////////
+    ood_data = dset.LSUN(root=data_root,
+                                transform=trn.Compose([trn.Resize(32), trn.CenterCrop(32), trn.ToTensor(), trn.Normalize(mean, std)]))
+    ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
+                                             num_workers=1, pin_memory=True)
+    print('\n\nLSUN_Resize Detection')
+    get_and_print_results(ood_loader)
+
+if "isun" in args.ood_datasets:
+    # /////////////// iSUN ///////////////
+    ood_data = dset.ImageFolder(root=data_root / "iSUN",
+                                transform=trn.Compose([trn.ToTensor(), trn.Normalize(mean, std)]))
+    ood_loader = torch.utils.data.DataLoader(ood_data, batch_size=args.test_bs, shuffle=True,
+                                             num_workers=1, pin_memory=True)
+    print('\n\niSUN Detection')
+    get_and_print_results(ood_loader)
 
 # /////////////// Mean Results ///////////////
 
